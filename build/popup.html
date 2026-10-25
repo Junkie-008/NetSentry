@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<!--   NetSentry Browser Extension - Popup Interface (v1.1 UI refresh)
+
+  Created by: ABHISHEK
+  Version: 1.1
+
+  Modern dark glassmorphism UI showing security status, risk breakdown,
+  security flags and protection statistics.
+-->
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    :root {
+      --bg: #0d1b2a;       /* deepest background */
+      --surface: #1b263b;  /* card surface */
+      --line: #415a77;     /* borders, accents, filled buttons */
+      --muted: #778da9;    /* secondary text */
+      --text: #e0e1dd;     /* primary text */
+      --card: rgba(27, 38, 59, 0.72);
+      --border: rgba(65, 90, 119, 0.5);
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      width: 380px;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Segoe UI', sans-serif;
+      background: radial-gradient(circle at 15% 0%, #1b263b 0%, #0d1b2a 60%);
+      color: var(--text);
+      -webkit-font-smoothing: antialiased;
+    }
+
+    .header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 16px 18px 14px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .logo {
+      width: 34px;
+      height: 34px;
+      border-radius: 10px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 18px;
+      background: linear-gradient(135deg, var(--line), var(--muted));
+      box-shadow: 0 6px 16px rgba(119, 141, 169, 0.35);
+      flex-shrink: 0;
+    }
+
+    .title { font-size: 15px; font-weight: 700; letter-spacing: 0.2px; }
+    .subtitle { font-size: 11px; color: var(--muted); }
+
+    main { padding: 14px 16px 12px; }
+
+    .status-card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-left: 4px solid var(--line);
+      border-radius: 14px;
+      padding: 14px 16px;
+      margin-bottom: 12px;
+      transition: border-color 0.3s ease;
+    }
+
+    /* risk encoded as brightness ramp: dim -> bright = safe -> dangerous */
+    .status-safe   { border-left-color: var(--line); }
+    .status-low    { border-left-color: var(--line); }
+    .status-warning{ border-left-color: var(--muted); }
+    .status-danger { border-left-color: var(--text); }
+
+    .status-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+
+    .status-text { display: flex; align-items: center; gap: 8px; font-weight: 700; font-size: 14px; }
+    .status-icon { font-size: 18px; }
+
+    .risk-score { font-size: 22px; font-weight: 800; font-variant-numeric: tabular-nums; }
+    .risk-score small { font-size: 11px; color: var(--muted); font-weight: 500; }
+
+    .risk-bar {
+      height: 7px;
+      margin-top: 12px;
+      background: rgba(119, 141, 169, 0.18);
+      border-radius: 999px;
+      overflow: hidden;
+    }
+
+    .risk-bar-fill {
+      height: 100%;
+      width: 0%;
+      border-radius: 999px;
+      background: linear-gradient(90deg, var(--line), var(--muted) 55%, var(--text));
+      transition: width 0.6s cubic-bezier(0.22, 1, 0.36, 1);
+    }
+
+    .domain-info {
+      background: rgba(13, 27, 42, 0.6);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 10px 12px;
+      margin-bottom: 12px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    .domain-info strong { display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 4px; }
+    .domain-info span {
+      font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', monospace;
+      color: var(--text);
+      word-break: break-all;
+    }
+
+    .actions { display: flex; gap: 10px; margin-bottom: 12px; }
+
+    .btn {
+      flex: 1;
+      padding: 9px 10px;
+      border: 1px solid transparent;
+      border-radius: 10px;
+      cursor: pointer;
+      font-size: 12px;
+      font-weight: 700;
+      transition: transform 0.15s ease, box-shadow 0.15s ease, background 0.2s ease;
+    }
+
+    .btn:active { transform: scale(0.97); }    .btn-report { background: rgba(119, 141, 169, 0.1); border-color: rgba(119, 141, 169, 0.55); color: var(--text); }
+
+    .btn-report:hover { background: rgba(119, 141, 169, 0.24); }
+
+    .btn-whitelist { background: var(--line); border-color: var(--muted); color: var(--text); }
+
+    .btn-whitelist:hover { background: var(--muted); color: var(--bg); }
+
+    .section-title {
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 1.2px;
+      color: var(--muted);
+      margin: 14px 0 8px;
+      font-weight: 700;
+    }
+
+    .reason, .flag {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      background: rgba(65, 90, 119, 0.28);
+      border: 1px solid rgba(119, 141, 169, 0.5);
+      border-radius: 8px;
+      padding: 7px 10px;
+      margin-bottom: 6px;
+      font-size: 12px;
+      color: var(--text);
+      line-height: 1.35;
+    }
+
+    .reason .pts { flex-shrink: 0; font-weight: 800; font-size: 11px; color: var(--muted); }
+
+    .flag { justify-content: flex-start; color: var(--text); background: rgba(65, 90, 119, 0.15); border-color: rgba(119, 141, 169, 0.4); border-style: dashed; }
+
+    .safe-note {
+      font-size: 12px;
+      color: var(--muted);
+      background: rgba(65, 90, 119, 0.12);
+      border: 1px dashed rgba(119, 141, 169, 0.45);
+      border-radius: 10px;
+      padding: 10px 12px;
+      margin-bottom: 4px;
+      line-height: 1.5;
+    }
+
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 8px;
+      margin-top: 14px;
+    }
+
+    .stat {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 10px 6px;
+      text-align: center;
+    }
+
+    .stat-number { font-size: 18px; font-weight: 800; font-variant-numeric: tabular-nums; }
+    .stat-label { font-size: 9px; text-transform: uppercase; letter-spacing: 0.8px; color: var(--muted); margin-top: 2px; }
+
+    .loading { text-align: center; padding: 34px 0 30px; }
+
+    .spinner {
+      border: 2px solid rgba(119, 141, 169, 0.2);
+      border-top: 2px solid var(--text);
+      border-radius: 50%;
+      width: 26px;
+      height: 26px;
+      animation: spin 0.8s linear infinite;
+      margin: 0 auto 12px;
+    }
+
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .footer {
+      text-align: center;
+      font-size: 10px;
+      color: var(--muted);
+      padding: 12px 16px 14px;
+      border-top: 1px solid var(--border);
+      opacity: 0.8;
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <div class="logo">🐊</div>
+    <div>
+      <div class="title">NetSentry</div>
+      <div class="subtitle">Real-time browsing protection</div>
+    </div>
+  </div>
+
+  <main>
+    <div id="loading" class="loading">
+      <div class="spinner"></div>
+      <div>Analyzing current page…</div>
+    </div>
+
+    <div id="content" style="display: none;">
+      <div id="status" class="status-card">
+        <div class="status-row">
+          <div class="status-text">
+            <span id="status-icon" class="status-icon"></span>
+            <span id="status-message"></span>
+          </div>
+          <div id="risk-score" class="risk-score"></div>
+        </div>
+        <div class="risk-bar"><div id="risk-bar-fill" class="risk-bar-fill"></div></div>
+      </div>
+
+      <div id="domain-info" class="domain-info">
+        <strong>Current Domain</strong>
+        <span id="current-domain"></span>
+      </div>
+
+      <div class="actions">
+        <button id="report-btn" class="btn btn-report">🚩 Report Phishing</button>
+        <button id="whitelist-btn" class="btn btn-whitelist">✅ Trust Site</button>
+      </div>
+
+      <div id="reasons" style="display: none;">
+        <div class="section-title">Risk Factors</div>
+        <div id="reasons-list"></div>
+      </div>
+
+      <div id="flags" style="display: none;">
+        <div class="section-title">Page Security Flags</div>
+        <div id="flags-list"></div>
+      </div>
+
+      <div class="stats">
+        <div class="stat">
+          <div id="sites-blocked" class="stat-number">0</div>
+          <div class="stat-label">Blocked</div>
+        </div>
+        <div class="stat">
+          <div id="threats-detected" class="stat-number">0</div>
+          <div class="stat-label">Threats</div>
+        </div>
+        <div class="stat">
+          <div id="sites-reported" class="stat-number">0</div>
+          <div class="stat-label">Reported</div>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <div class="footer">
+    All analysis happens locally — nothing ever leaves your browser
+  </div>
+
+  <script src="detector.js"></script>
+  <script src="popup.js"></script>
+</body>
+</html>

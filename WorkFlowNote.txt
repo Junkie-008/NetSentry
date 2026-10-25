@@ -1,0 +1,811 @@
+================================================================================
+ P H I S H I N G   D E T E C T O R   -   B R O W S E R   E X T E N S I O N
+ WORKFLOW & TECHNICAL NOTES  (WorkFlowNote.txt)
+================================================================================
+ Version: 1.1        |  Author: ABHISHEK  |  Manifest: Chrome MV3
+ Runtime: Chrome/Edge (Chromium)  |  Analysis: 100% local, no server calls
+================================================================================
+
+ TABLE OF CONTENTS
+ -----------------
+  1. Project Overview
+  2. File & Directory Structure
+  3. High-Level Architecture Diagram
+  4. End-to-End Working Pipeline (navigation -> outcome)
+  5. Risk Scoring Engine (detector.js) - Flowchart + Points Table
+  6. Feature Catalog (detailed)
+  7. Content Script Pipeline (page analysis)
+  8. Popup Pipeline & Message API
+  9. UI Gallery (screenshots + layout mockups)
+ 10. Data Storage Schema (chrome.storage)
+ 11. Permissions & Privacy Model
+ 12. Build Pipeline (build.sh)
+ 13. Test Pipeline (5 levels, how to run)
+ 14. Bug-Fix Changelog (v1.0 -> v1.1)
+ 15. Known Limitations & Future Work
+
+================================================================================
+ 1. PROJECT OVERVIEW
+================================================================================
+
+ A Manifest V3 Chrome extension that protects users from phishing in real time.
+ It analyzes every URL you visit with a multi-factor heuristic risk score
+ (0-100), warns on medium-risk pages, fully blocks high-risk pages, highlights
+ dangerous page elements (links/forms), and shows a dashboard popup.
+
+ Design principles:
+   - LOCAL ONLY: all scoring happens inside the extension; no network calls.
+   - ONE SOURCE OF TRUTH: a single shared engine (detector.js) is loaded by
+     the background worker, the content script and the popup, so the badge,
+     banner, block page and popup can never disagree about a score.
+   - TESTABLE: the engine is pure JS with zero Chrome APIs -> 122 automated
+     tests (unit / integration / system / acceptance / performance).
+
+ UI PALETTE (v1.1 restyle):
+   #0D1B2A deep background | #1B263B card surfaces | #415A77 accents/borders
+   #778DA9 secondary text  | #E0E1DD primary text & highlights.
+   Risk level is encoded as BRIGHTNESS: dim slate = safe, off-white = danger.
+
+ Risk bands (identical in code, README and test docs):
+   +----------+-------+--------------------------------------+------------------+
+   |  SCORE   | LEVEL |  UI                                 | ACTION           |
+   +----------+-------+--------------------------------------+------------------+
+   |   0-20   | safe  |  #415A77 accent - "Safe Site"       | none             |
+   |  21-40   | low   |  #415A77 accent - "Low Risk"        | none             |
+   |  41-70   | medium|  #778DA9 accent - "Be Cautious"     | warning banner   |
+   |  71-100  | high  |  #E0E1DD accent - "Phishing"        | BLOCK page       |
+   +----------+-------+--------------------------------------+------------------+
+   Toolbar badge:  "" (safe/low)  "?" #778DA9 (>40)  "!" #E0E1DD (>70),
+   badge text color #0D1B2A (setBadgeTextColor).
+
+================================================================================
+ 2. FILE & DIRECTORY STRUCTURE
+================================================================================
+
+   browser-addon/
+   |-- manifest.json          MV3 manifest: permissions, scripts, icons
+   |-- detector.js            SHARED detection engine (pure, unit-tested)
+   |-- background.js          Service worker: events, decisions, injection
+   |-- content.js             Content script: DOM/page analysis (PageAnalyzer)
+   |-- popup.html             Popup UI (dark glassmorphism design + inline CSS)
+   |-- popup.js               Popup controller (PopupController)
+   |-- blocked.html           Hardened block page (redirect target, web-accessible)
+   |-- blocked.js             Block page controller (safe textContent rendering)
+   |-- styles.css             Content-script overlay/indicator styles
+   |-- icons/                 icon16/32/48/128 (.png + .svg sources)
+   |-- build.sh               Build script -> build/ + netsentry-extension.zip
+   |-- package.json           Test scripts + dev deps (jsdom, puppeteer-core)
+   |-- tests/                 5-level test suite (see section 13)
+   |   |-- unit/              detector.test.js, performance.test.js
+   |   |-- integration/       background.test.js, content.test.js
+   |   |-- system/            build.test.js, e2e.test.js (headless Chrome)
+   |   |-- acceptance/        acceptance.test.js (docs-vs-code contract)
+   |   `-- helpers/           chrome-mock.js (in-memory chrome.* APIs)
+   |-- scripts/
+   |   |-- capture-ui-screenshots.js   regenerates docs/images/*.png
+   |   `-- qwen.sh             supervised one-shot prompt runner for local LLM
+   |-- docs/images/           UI screenshots (4 PNG files, see section 9)
+   |-- README.md              User documentation
+   |-- test_sites.md          Manual test catalogue + expected results
+   `-- test_paypal_detection.html  PayPal detection test page
+
+================================================================================
+ 3. HIGH-LEVEL ARCHITECTURE DIAGRAM
+================================================================================
+
+  +-------------------------------------------------------------------------+
+  |                         CHROME BROWSER                                  |
+  |                                                                         |
+  |  +-----------------------+   events    +------------------------------+  |
+  |  |  NAVIGATION LAYER     |------------>|  background.js (MV3 SW)      |  |
+  |  |  tabs.onUpdated       |             |  - PhishingDetector class    |  |
+  |  |  webNavigation        |             |  - dedupe / stats / badge    |  |
+  |  |  tabs.onRemoved       |             |  - block & warn injection    |  |
+  |  +-----------------------+             +--------+-----------+---------+  |
+  |                                                 |           |            |
+  |                          importScripts()        |           | messages   |
+  |                                                 v           v            |
+  |                                  +------------------+   +-------------+  |
+  |                                  | detector.js      |<--| popup.html  |  |
+  |                                  | SHARED ENGINE    |   | popup.js    |  |
+  |                                  | analyzeUrl()     |   +------+------+  |
+  |                                  | thresholds 40/70 |          ^         |
+  |                                  +--+------------+--+          |         |
+  |                                     ^            ^     chrome.runtime   |
+  |                 loaded via manifest |            |     .sendMessage     |
+  |                 js[0] order         |            |            |         |
+  |                              +-------+--+   +-----+------+     |         |
+  |                              | content.js|   | chrome.    |----+         |
+  |                              | PageAn-   |   | storage    |              |
+  |                              | alyzer    |   | local      |              |
+  |                              +-----+-----+   +------------+              |
+  |                                    | DOM analysis                         |
+  |                                    v                                      |
+  |  +--------------------------------------------------------------+        |
+  |  |  WEB PAGE  (http/https)                                      |        |
+  |  |  - suspicious links/forms highlighted (styles.css classes)   |        |
+  |  |  - window.phishingFlags[] -> shown in popup                  |        |
+  |  |  - warning banner OR full block screen injected              |        |
+  |  +--------------------------------------------------------------+        |
+  +-------------------------------------------------------------------------+
+
+ Components and their single responsibility:
+   detector.js  - decide if a URL is risky (pure function, no chrome APIs)
+   background.js- react to browser events, run side effects, persist data
+   content.js   - inspect page CONTENT (DOM text, links, forms) for signals
+   popup.js     - render the dashboard and expose user actions
+   styles.css   - force-styled overlays (!important) that pages cannot hide
+
+================================================================================
+ 4. END-TO-END WORKING PIPELINE (navigation -> outcome)
+================================================================================
+
+ Trigger: the user types a URL / clicks a link.
+
+   (A) EARLY SIGNAL - webNavigation.onBeforeNavigate (frameId 0)
+   -------------------------------------------------------------------
+   fires BEFORE the tab commits to the new page (tab may still show
+   about:blank). Used ONLY to refresh badge/storage:
+
+     onBeforeNavigate(url, tabId)
+        |
+        v
+     analyzeUrl(url, tabId, { sideEffects: false })
+        |-- Detector.analyzeUrl() -> report {score, level, reasons}
+        |-- updateBadge(tabId, score)          [! / ? / ""]
+        `-- store analysis_<tabId>  (for popup)
+
+   (B) COMMITTED PAGE - tabs.onUpdated (status === "complete")
+   -------------------------------------------------------------------
+     tabs.onUpdated(tabId, {status:"complete"}, tab)
+        |
+        v
+     analyzeUrl(tab.url, tabId, { sideEffects: true })
+        |
+        +-- report.skipped? (chrome://, about:, file:, data:) --> badge reset, STOP
+        |
+        +-- dedupe check: same tabId+URL within 5s? --> skip side effects
+        |   (prevents double counting: BOTH events fire per navigation)
+        |
+        +-- score > 70  => BLOCK:  blockPhishingSite()
+        |                    |- domain added to suspiciousDomains (persisted)
+        |                    |- inject full-screen block page (chrome.scripting)
+        |                    `- stats.sitesBlocked++, threatsDetected++
+        |
+        +-- score > 40  => WARN:   warnUser()
+        |                    |- inject #phishing-warning banner (auto-dismiss 10s)
+        |                    `- stats.threatsDetected++
+        |
+        |-- updateBadge()
+        `-- persist analysis_<tabId> {url, domain, riskScore, level, reasons}
+
+   (C) TAB CLOSE - tabs.onRemoved(tabId)
+   -------------------------------------------------------------------
+        |- delete in-memory dedupe entry
+        `- chrome.storage.remove(analysis_<tabId>)   [no storage leaks]
+
+   (D) USER ACTIONS (popup)
+   -------------------------------------------------------------------
+     Report Phishing --> runtime message reportPhishing(url)
+     |                     `-> suspiciousDomains.add(domain) + stats.sitesReported++
+     |                         (future visits of that domain score >= 80 -> blocked)
+     Trust Site ------> chrome.storage.local.set({whitelistedDomains:[...]})
+                           `-> storage.onChanged -> background reloads whitelist
+                               `-> popup re-requests getAnalysis -> score 0
+
+ TIMELINE OF A BLOCKED VISIT:
+
+   t0  beforeNavigate   badge set to "!", analysis stored (no injection yet)
+   t1  page commits     content script runs (page analysis starts)
+   t2  status=complete  dedupe pass -> blockPhishingSite() -> DOM replaced
+   t3  user sees        "PHISHING SITE BLOCKED" screen with score + reasons
+   t4  popup opened     shows High Risk 100/100 + same reasons + stats
+
+================================================================================
+ 5. RISK SCORING ENGINE (detector.js)
+================================================================================
+
+ 5.1 SCORING FLOWCHART
+
+                 Detector.analyzeUrl(url, options)
+                            |
+                            v
+                 +--> parseUrl(url) --+-- invalid ---> {error:"invalid-url", 0}
+                 |                    |
+                 |                    `-- OK: URL object
+                 |                           |
+                 |              protocol != http(s)? -- YES --> {skipped:true, 0}
+                 |                           |
+                 |                          NO
+                 |                           v
+                 |        isWhitelisted(host, whitelistedDomains)? -- YES --> 0
+                 |                           |
+                 |                          NO
+                 |                           v
+                 |              +--------------------------+
+                 |              | suspiciousDomains has it | -- YES --> +80
+                 |              +--------------------------+
+                 |                           |
+                 |                           v
+                 |              +--------------------------+
+                 |              | A. DOMAIN ANALYSIS       |
+                 |              +--------------------------+
+                 |              | suspicious TLD      +45 |
+                 |              | domain len > 30     +15 |
+                 |              | subdomains > 3      +45 |
+                 |              | digits+letters      +10 |
+                 |              | homograph/punycode  +40 |
+                 |              | brand impersonation +75 |
+                 |              |   (paypal variant  +80) |
+                 |              |   (char subst.     +75) |
+                 |              +--------------------------+
+                 |                           +
+                 |                           v
+                 |              +--------------------------+
+                 |              | B. URL STRUCTURE         |
+                 |              +--------------------------+
+                 |              | http + login/secure/etc +40
+                 |              | URL shortener        +25 |
+                 |              | ".." in path         +30 |
+                 |              | URL length > 100     +10 |
+                 |              | redirect / url=      +15 |
+                 |              +--------------------------+
+                 |                           +
+                 |                           v
+                 |              +--------------------------+
+                 |              | C. PATTERN ANALYSIS      |
+                 |              | (first 2000 chars only)  |
+                 |              | 8 phishing phrases       |
+                 |              | each match           +20 |
+                 |              +--------------------------+
+                 |                           |
+                 |                           v
+                 `---- score = min(sum, 100) --> level = getRiskLevel(score)
+                                                     |
+                                        +------------+------------+
+                                        |  reasons[] accumulated  |
+                                        |  along every stage      |
+                                        `------------+------------+
+                                                     v
+                              { score, level, reasons, whitelisted, ... }
+
+ 5.2 POINTS TABLE (complete)
+
+   +-------------------------------------------+--------+-----------+
+   | SIGNAL                                    | POINTS | STAGE     |
+   +-------------------------------------------+--------+-----------+
+   | Domain previously reported by user        |   +80  | pre       |
+   | Suspicious TLD (.tk .ml .ga .cf .gq)      |   +45  | domain    |
+   | Excessive subdomains (> 3)                |   +45  | domain    |
+   | Domain longer than 30 chars               |   +15  | domain    |
+   | Digits mixed with letters in domain       |   +10  | domain    |
+   | Homograph / punycode (xn-- label)         |   +40  | domain    |
+   | PayPal variant (paypa1, payp4l, papyal..) |   +80  | domain    |
+   | Character substitution (g00gle, m1crosoft)|   +75  | domain    |
+   | Brand at label boundary, non-official host|   +75  | domain    |
+   | Plain HTTP on login/security-related host |   +40  | structure |
+   | URL shortener (bit.ly, t.co, ...)         |   +25  | structure |
+   | ".." path traversal in path               |   +30  | structure |
+   | Whole URL longer than 100 chars           |   +10  | structure |
+   | redirect / url= in query string           |   +15  | structure |
+   | Brand hidden in URL userinfo (a@b trick)  |   +75  | structure |
+   | Each phishing phrase in URL (8 phrases)   |   +20  | pattern   |
+   +-------------------------------------------+--------+-----------+
+   TOTAL is capped at 100.
+
+   Whitelisted domain       -> forced 0 (reasons cleared)
+   Non-http(s) scheme       -> skipped, score 0 (chrome://, about:, data:)
+
+ 5.3 PHISHING URL PHRASES (pattern stage, bounded regex {0,N})
+
+   secure..verify | account..suspended | click..here..immediately |
+   urgent..action..required | verify..identity | update..payment |
+   suspicious..activity | limited..time
+
+   NOTE: quantifiers are BOUNDED ({0,80}) instead of ".*" so a 120 KB
+   pathological URL is scored in ~0.2 ms instead of ~870 ms (v1.0 bug).
+
+ 5.4 BRAND IMPERISONATION RULE (false-positive safe)
+
+   flagged  = brand appears on BOTH-side label boundary  ("paypal-security",
+              "secure-paypal", "paypal.evil.com")
+   AND NOT  = official domain (paypal.com, www.paypal.com, paypal.com.br)
+   NOT flagged: microsoftonline.com (letter after brand), pineapple.com
+                (letter before brand), login.microsoft.com (official subdomain)
+
+================================================================================
+ 6. FEATURE CATALOG (detailed)
+================================================================================
+
+ F1. REAL-TIME URL ANALYSIS
+     - Every top-frame navigation is scored twice: early signal at
+       onBeforeNavigate (badge only) and full side effects at
+       tabs.onUpdated "complete".
+     - Result cached per tab under analysis_<tabId> for the popup.
+     - Browser-internal URLs (chrome://, about:, file:, data:) are skipped.
+
+ F2. RISK SCORING WITH REASONS
+     - 0-100 score built from 15+ signals in 3 stages (see section 5).
+     - Every point contributes a human-readable reason, e.g.
+       "PayPal impersonation pattern detected (+80)" - shown in the popup
+       (Risk Factors) and on the block screen ("Why this was blocked").
+
+ F3. AUTOMATIC BLOCKING (score > 70)
+     - chrome.scripting.executeScript replaces the page DOM with a full-screen
+       block card: shield icon, domain chip, risk score, reason list,
+       "Go Back" (history.back) and "Close Tab" buttons.
+     - The domain is persisted to suspiciousDomains so every future visit
+       scores >= 80 immediately (even before page analysis).
+     - HARDENED: right after injection the tab is redirected to the
+       web-accessible blocked.html extension page - this unloads the hostile
+       document completely, so its JavaScript can no longer rewrite the
+       block screen or auto-submit forms (changelog 15/16). The dedupe
+       marker is cleared so pressing Back re-blocks immediately.
+
+ F4. WARNING BANNER (score > 40, <= 70)
+     - Non-destructive overlay #phishing-warning (styles.css class
+       phishing-warning-overlay) pinned to the top of the page.
+     - Shows domain + risk score, Dismiss button, auto-dismisses after 10 s.
+     - Never injected twice (element existence check).
+
+ F5. TOOLBAR BADGE
+     - "!" off-white (#e0e1dd) for blocked risk, "?" mid-slate (#778da9) for
+       warning, empty otherwise; dark text (#0d1b2a), per-tab badge, same
+       40/70 thresholds as everything else.
+
+ F6. TRUST (WHITELIST) SYSTEM
+     - Defaults: google.com, facebook.com, microsoft.com, apple.com,
+       amazon.com, github.com, stackoverflow.com, wikipedia.org.
+     - Popup "Trust Site" appends the domain to chrome.storage;
+       background picks it up via storage.onChanged.
+     - Subdomain-aware: trusting example.com also trusts a.b.example.com.
+     - getAnalysis recomputes the score live -> popup flips to 0/100.
+
+ F7. REPORT PHISHING
+     - Popup button posts the URL via runtime message; background adds the
+       domain to suspiciousDomains (persisted) and stats.sitesReported++.
+     - Next visit to that domain is blocked automatically.
+
+ F8. STATISTICS
+     - stats: sitesBlocked / threatsDetected / sitesReported.
+     - Incremented by the background worker only (serialized read-modify-write
+       to avoid lost updates); popup only displays them.
+     - Popup shows 3 tiles: BLOCKED / THREATS / REPORTED.
+
+ F9. CONTENT ANALYSIS (content.js) - see section 7 for the pipeline.
+
+ F10. INSECURE FORM GUARD
+     - Forms with password/email/card fields on http:// are highlighted
+       (phishing-detector-insecure-form) and submissions trigger a native
+       confirm(); declining calls preventDefault().
+
+ F11. DYNAMIC RE-ANALYSIS
+     - MutationObserver on documentElement (works even when body is null at
+       document_start); debounced to one re-analysis per 100 ms burst.
+     - Duplicate marking prevented via data-pd-marked attribute; duplicate
+       flags prevented via array membership check.
+
+ F12. POPUP DASHBOARD - see section 8.
+
+================================================================================
+ 7. CONTENT SCRIPT PIPELINE (content.js - PageAnalyzer)
+================================================================================
+
+ manifest: js = [detector.js, content.js], css = styles.css,
+           run_at = document_start, matches = <all_urls>
+
+   document_start
+        |
+        +--> init()
+        |      |-- readyState loading? --YES--> wait DOMContentLoaded
+        |      |-- monitorForms(): document 'submit' listener
+        |      `-- observeMutations(): MutationObserver(documentElement)
+        |           (BUG FIX: v1.0 observed document.body -> null crash)
+        |
+        v  (DOM ready)
+   analyzePage()
+        |
+        +--> analyzeLinks()
+        |      |-- isSuspiciousLink(): shortener host, "..", length > 100
+        |      |-- isMisleadingLink(): text says paypal/google/.. but URL does not
+        |      `-- markSuspiciousElement()  --> class + title + click confirm
+        |
+        +--> analyzeForms()
+        |      |-- password/email/card fields on non-HTTPS --> insecure-form mark
+        |      `-- form action matches isSuspiciousUrl() (secure+verify host,
+        |          > 4 labels) --> marked
+        |
+        +--> analyzeImages()
+        |      `-- cross-origin image and not a known CDN --> marked
+        |
+        +--> analyzeText()
+        |      |-- TreeWalker over body, SKIPPING script/style/noscript
+        |      |-- match 8 phishing keywords (Detector.PHISHING_KEYWORDS)
+        |      `-- addSuspiciousFlag() -> window.phishingFlags[] (deduped)
+        |
+        `-- checkSSL()
+               `-- http + password/email/card form present
+                   -> flag "Non-HTTPS site collecting sensitive information"
+
+   MutationObserver loop:
+      added nodes contain <form>/<a>  --> debounce 100ms --> analyzePage() again
+
+   Output channels:
+      a) element marks   (styles.css classes, visible to the user)
+      b) window.phishingFlags[]  (read by popup via chrome.scripting)
+
+================================================================================
+ 8. POPUP PIPELINE & MESSAGE API
+================================================================================
+
+ 8.1 POPUP DATA FLOW
+
+   user clicks toolbar icon
+        |
+        v
+   popup.html loads  [detector.js then popup.js]
+        |
+        v
+   DOMContentLoaded -> new PopupController().init()
+        |
+        +--> loadAnalysis()
+        |      |  chrome.runtime.sendMessage({action:"getAnalysis"})
+        |      |            |
+        |      |            v  (background, async channel kept open)
+        |      |    getActiveAnalysis():
+        |      |      1. tabs.query(active, currentWindow) -> tab.url
+        |      |      2. read stored analysis_<tabId> (known URL)
+        |      |      3. RECOMPUTE with current whitelist/suspicious lists
+        |      |      4. persist fresh analysis, respond
+        |      |
+        |      v
+        |    displayAnalysis():
+        |      - domain chip (current-domain)
+        |      - status card via Detector.getRiskLevel() (icon + text + color)
+        |      - risk score "N/100" + animated gauge (risk-bar-fill width %)
+        |      - Risk Factors list from reasons[] (label + points)
+        |
+        +--> loadSecurityFlags()   chrome.scripting.executeScript(tab,
+        |                               () => window.phishingFlags || [])
+        |                           -> "Page Security Flags" section
+        |
+        +--> loadStats()           chrome.storage.local.get('stats')
+        |                           -> 3 stat tiles
+        |
+        `--> setupEventListeners()
+               |-- report-btn  -> runtime reportPhishing -> toast + refresh stats
+               `-- whitelist-btn -> storage.whitelistedDomains += domain
+                                   -> toast -> loadAnalysis() (score -> 0)
+
+   State rendering:
+     loading spinner  ->  content (status card / empty state / error card)
+
+ 8.2 MESSAGE API (chrome.runtime)
+
+   +------------------+-------------------+--------------------------------+
+   | ACTION           | PAYLOAD           | RESPONSE                       |
+   +------------------+-------------------+--------------------------------+
+   | getAnalysis      | -                 | {url, domain, riskScore,       |
+   |                  |                   |  level, reasons[], timestamp}  |
+   |                  |                   |  or null                       |
+   | reportPhishing   | {url}             | {success: true|false}          |
+   +------------------+-------------------+--------------------------------+
+   getAnalysis returns true from the listener to keep the channel open for
+   its async response; reportPhishing responds synchronously.
+
+ 8.3 STORAGE CHANGE PROTOCOL (popup -> background)
+
+   popup writes whitelistedDomains/suspiciousDomains/stats ->
+   background storage.onChanged listener rebuilds in-memory Sets ->
+   every subsequent getReport() uses the new lists.
+
+================================================================================
+ 9. UI GALLERY (screenshots + layout mockups)
+================================================================================
+
+ Screenshots are PNG files in docs/images/ (captured from a REAL extension
+ running in headless Chrome; regenerate with:
+     node scripts/capture-ui-screenshots.js
+
+  9.1  docs/images/popup-high-risk.png
+       -------------------------------
+       Popup showing a blocked-risk site. Shows: header with gator logo,
+       status card (off-white left border, "High Risk - Potential Phishing",
+       100/100, slate->off-white gauge filled full), domain chip (monospace),
+       Report Phishing / Trust Site buttons, RISK FACTORS breakdown
+       (+10 digits, +80 PayPal impersonation, +40 insecure HTTP login host),
+       stats tiles (12 BLOCKED / 34 THREATS / 7 REPORTED), privacy footer.
+
+       +--------------------------------------------------+
+       | [S] NetSentry                                     |
+       |     Real-time browsing protection                |
+       +--------------------------------------------------+
+       | !  High Risk - Potential Phishing      100/100   |
+       | [========== gauge (full off-white) ===========]|
+       +--------------------------------------------------+
+       | CURRENT DOMAIN                                    |
+       | paypa1-login.com                                  |
+       +--------------------------------------------------+
+       |  [ Report Phishing ]    [ Trust Site ]            |
+       +--------------------------------------------------+
+       | RISK FACTORS                                      |
+       |  Digits mixed with letters in domain        +10  |
+       |  PayPal impersonation pattern detected      +80  |
+       |  Insecure HTTP on a login/security host     +40  |
+       +--------------------------------------------------+
+       |    12      |     34     |      7                   |
+       |  BLOCKED   |  THREATS   |  REPORTED                |
+       +--------------------------------------------------+
+       | All analysis happens locally - nothing leaves you  |
+       +--------------------------------------------------+
+
+  9.2  docs/images/popup-safe.png
+       --------------------------
+       Same popup for a trusted/safe site: slate status card
+       "Safe Site 0/100", empty gauge, github.com chip, RISK FACTORS section
+       hidden (no reasons), stats 0/0/0.
+
+  9.3  docs/images/block-page.png
+       ---------------------------
+       Full-screen block screen injected over a high-risk page (score 90):
+       deep-navy radial gradient background, slate glass card, shaking shield,
+       off-white title "PHISHING SITE BLOCKED", monospace domain chip, score,
+       "Why this was blocked" list with each reason and its points,
+       Go Back (primary) / Close Tab (secondary) buttons, privacy footer.
+
+  9.4  docs/images/warning-banner.png
+       -------------------------------
+       Non-destructive warning: slate gradient (#415A77 -> #1B263B) strip
+       pinned to the top of the real page - "SUSPICIOUS SITE DETECTED",
+       "127.0.0.1 - risk 50/100", pill-shaped Dismiss button. Page content
+       stays readable underneath.
+
+  9.5 VISUAL STATE MATRIX
+
+   +----------------+-----------------+-----------------+------------------+
+   | SIGNAL         | POPUP           | BADGE           | PAGE            |
+   +----------------+-----------------+-----------------+------------------+
+   | score 0-20     | slate Safe Site | (empty)         | untouched        |
+   | score 21-40    | slate Low Risk  | (empty)         | untouched        |
+   | score 41-70    | mid-slate caution | "?" #778DA9   | warning banner   |
+   | score 71-100   | off-white High  | "!" #E0E1DD     | BLOCK screen     |
+   | chrome:// etc  | "--" empty state| (empty)         | untouched        |
+   | trusted domain | slate 0/100     | (empty)         | untouched        |
+   +----------------+-----------------+-----------------+------------------+
+
+================================================================================
+ 10. DATA STORAGE SCHEMA (chrome.storage.local)
+================================================================================
+
+   +--------------------+-------------+-------------------------------------+
+   | KEY                | TYPE        | WRITTEN BY / READ BY                |
+   +--------------------+-------------+-------------------------------------+
+   | suspiciousDomains  | string[]    | background (block/report)           |
+   |                    |             | background (load + onChanged)       |
+   | whitelistedDomains | string[]    | popup (Trust Site)                  |
+   |                    |             | background (load + onChanged)       |
+   | stats              | object      | background (serialized ++ )         |
+   |   .sitesBlocked    | number      | popup (display)                     |
+   |   .threatsDetected | number      |                                     |
+   |   .sitesReported   | number      |                                     |
+   | analysis_<tabId>   | object      | background (write on analysis,      |
+   |   .url/.domain     |             |   recompute on getAnalysis)         |
+   |   .riskScore       | number      | popup reads via getAnalysis message |
+   |   .level           | safe|low|   |                                     |
+   |                    | medium|high |                                     |
+   |   .reasons[]       | {label,pts} |                                     |
+   |   .timestamp       | number      |                                     |
+   +--------------------+-------------+-------------------------------------+
+   Cleanup: analysis_<tabId> deleted on tabs.onRemoved (no leaks).
+
+================================================================================
+ 11. PERMISSIONS & PRIVACY MODEL
+================================================================================
+
+   +------------------+---------------------------------------------------+
+   | PERMISSION       | WHY IT IS NEEDED                                  |
+   +------------------+---------------------------------------------------+
+   | tabs             | read tab URLs to analyze, per-tab badge/cleanup   |
+   | webNavigation    | early beforeNavigate signal per main-frame nav    |
+   | storage          | persist whitelist / suspicious list / stats       |
+   | scripting        | inject block page, warning banner, read page flags|
+   | activeTab        | current tab for popup actions                     |
+   | <all_urls>       | analyze + inject on any site (host permission)    |
+   +------------------+---------------------------------------------------+
+   Removed in v1.1: webRequest, declarativeContent (declared but never used).
+   Removed: web_accessible_resources entry for non-existent warning.html.
+
+   PRIVACY: no fetch/XHR/WebSocket/sendBeacon anywhere in shipped code
+   (enforced by automated tests: system "no external network endpoints"
+   + acceptance "README privacy claim"). Everything is computed locally.
+
+================================================================================
+ 12. BUILD PIPELINE (build.sh)
+================================================================================
+
+   $ bash build.sh
+        |
+        +--> mkdir build/ ; rm -rf build/*
+        +--> copy sources: manifest, detector.js, background, content,
+        |                  popup.html, popup.js, styles.css
+        +--> copy docs: README, LICENSE, CREDITS, INSTALLATION
+        +--> copy icons (PNG if present, else SVG + warning)
+        +--> generate build/package_info.txt (file list + install steps)
+        `--> package -> netsentry-extension.zip
+                         (zip, or PowerShell Compress-Archive fallback)
+
+   Load result: chrome://extensions -> Developer mode -> Load unpacked
+                -> select build/  (or unzip the package)
+   The system test suite validates the build output on every test run.
+
+================================================================================
+ 13. TEST PIPELINE (5 levels - 122 tests, 14 suites, all green)
+================================================================================
+
+   $ npm install      # dev deps: jsdom, puppeteer-core (test-only)
+   $ npm test         # everything
+   $ npm run test:unit | test:integration | test:system | test:acceptance
+
+   +-------------+---------------------------+--------+------------------------+
+   | LEVEL       | FILES                     | COUNT  | VERIFIES              |
+   +-------------+---------------------------+--------+------------------------+
+   | UNIT        | unit/detector.test.js     |   59   | positive: known       |
+   |             |                           |        | phishing URLs score   |
+   |             |                           |        | high; negative: 12    |
+   |             |                           |        | legit URLs score 0;   |
+   |             |                           |        | boundary: 20/21,      |
+   |             |                           |        | 40/41, 70/71, 30/31   |
+   |             |                           |        | char domain, 3/4      |
+   |             |                           |        | subdomains, 100/101   |
+   |             |                           |        | char URL, cap 100;    |
+   |             |                           |        | edge: invalid/null    |
+   |             |                           |        | URLs, chrome://, data:,|
+   |             |                           |        | IP hosts, punycode,   |
+   |             |                           |        | 10KB URLs             |
+   +-------------+---------------------------+--------+------------------------+
+   | PERFORMANCE | unit/performance.test.js   |    6   | 10k URLs < 2s         |
+   |             |                           |        | (measured 469ms,      |
+   |             |                           |        | 0.047ms/URL); 120KB   |
+   |             |                           |        | pathological regex    |
+   |             |                           |        | < 100ms (0.2ms); 50KB |
+   |             |                           |        | URL; 1k worst-case;   |
+   |             |                           |        | 1k whitelist entries  |
+   +-------------+---------------------------+--------+------------------------+
+   | INTEGRATION | integration/background.js  |   13   | real background.js    |
+   |             | integration/content.js     |    8   | driven through mock   |
+   |             |                           |        | chrome.* events:      |
+   |             |                           |        | block once (dedupe),  |
+   |             |                           |        | warn, badge bands,    |
+   |             |                           |        | getAnalysis, Trust     |
+   |             |                           |        | Site -> 0, report flow,|
+   |             |                           |        | tab cleanup; content  |
+   |             |                           |        | in jsdom: positive/   |
+   |             |                           |        | negative pages,       |
+   |             |                           |        | document_start (null  |
+   |             |                           |        | body) regression,     |
+   |             |                           |        | form-submit confirm,  |
+   |             |                           |        | re-analysis dedupe    |
+   +-------------+---------------------------+--------+------------------------+
+   | SYSTEM      | system/build.test.js       |   11   | manifest consistency, |
+   |             | system/e2e.test.js         |    5   | every referenced file,|
+   |             |                           |        | node --check syntax,  |
+   |             |                           |        | permissions, build.sh |
+   |             |                           |        | + zip output; E2E:    |
+   |             |                           |        | EXTENSION LOADED IN   |
+   |             |                           |        | HEADLESS CHROME -     |
+   |             |                           |        | safe page untouched,  |
+   |             |                           |        | warn banner (score 50,|
+   |             |                           |        | dismissible), block   |
+   |             |                           |        | screen (score 90),    |
+   |             |                           |        | popup stats = 1       |
+   +-------------+---------------------------+--------+------------------------+
+   | ACCEPTANCE  | acceptance/acceptance.js   |   20   | every documented      |
+   |             |                           |        | promise: README       |
+   |             |                           |        | thresholds 40/70,     |
+   |             |                           |        | risk band table,      |
+   |             |                           |        | privacy claim,        |
+   |             |                           |        | test_sites.md safe    |
+   |             |                           |        | list + brand cases,   |
+   |             |                           |        | test_paypal scores    |
+   |             |                           |        | 80/40/10 -> 100 cap,  |
+   |             |                           |        | manual Test Cases     |
+   |             |                           |        | 1/3/4/5/6             |
+   +-------------+---------------------------+--------+------------------------+
+   TOTAL: 122 tests / 14 suites / 0 failing (~4s wall, suites in parallel)
+   Note: the E2E suite needs Chrome on the machine; it skips if none found.
+
+================================================================================
+ 14. BUG-FIX CHANGELOG (v1.0 -> v1.1)
+================================================================================
+
+   1. Homograph detection was DEAD CODE - URL parser punycodes non-ASCII
+      hosts, so the Cyrillic/Greek regex never matched. Now detects xn--
+      labels as well.
+   2. "Trust Site" did nothing - popup saved whitelistedDomains but the
+      background worker never read it. Now loaded, synced via onChanged,
+      subdomain-aware, and getAnalysis recomputes live.
+   3. document_start crash - MutationObserver observed document.body while
+      it was still null -> TypeError, mutation monitoring never started.
+      Now observes documentElement (regression-tested).
+   4. Threshold chaos - README said 40/70, code used 30/60, badge 40/70,
+      popup 20/40/70. Unified on Detector.RISK_THRESHOLDS = {WARN:40, BLOCK:70}.
+   5. Stats never worked - sitesBlocked was never incremented; also fixed a
+      read-modify-write race that silently lost concurrent increments
+      (serialized queue now).
+   6. Brand false positives/negatives - substring match flagged
+      microsoftonline.com / pineapple.com; boundary rule fixed those and now
+      actually blocks the documented fake-brand domains (75-80 points).
+   7. Regex backtracking - /secure.*verify/i took ~870ms on 120KB input;
+      bounded {0,N} quantifiers -> ~0.2ms.
+   8. Injection timing - onBeforeNavigate fires before the tab commits
+      (about:blank) so executeScript failed and dedupe swallowed the retry.
+      Side effects now run only on committed loads (tabs.onUpdated complete).
+   9. Block-page arg bug - reasons string passed where an array was expected
+      ("reasonItems.map is not a function") killed the injection; caught by
+      the E2E test.
+  10. manifest.json referenced non-existent warning.html; unused
+      webRequest/declarativeContent permissions removed; detector.js added to
+      content_scripts (and build.sh) so all contexts share one engine.
+  11. Per-tab analysis storage leaked after tabs closed -> cleaned onRemoved.
+  12. Same navigation counted twice (onUpdated + beforeNavigate) -> dedupe.
+  13. Content script scanned <script>/<style> text -> false keyword flags;
+      now skipped by the TreeWalker filter.   14. test_sites.md / test_paypal_detection.html contradicted the code
+       (thresholds, scores) - docs corrected and locked by acceptance tests.
+
+   AUDIT ROUND - local qwen3.5:9b under supervision (3 prompts, assessed
+   against the code; 1 real finding, 1 hallucination set, all verified):
+
+   15. [qwen finding - VALID] Malicious IFrames were invisible: content
+       scripts ran in the top frame only and only frameId 0 was scored.
+       Fixed: all_frames: true in the manifest + the popup now merges
+       window.phishingFlags across every frame (executeScript allFrames).
+       Verified by a new headless-Chrome E2E test with an insecure form
+       inside an iframe.
+   16. [qwen finding - VALID] The injected block screen shared the document
+       with the hostile page's own JavaScript, which could rewrite the DOM
+       back (and auto-submit forms before status=complete). Fixed: after
+       injection the tab is redirected to blocked.html (extension page,
+       MV3 CSP, textContent-only rendering), unloading the hostile document;
+       dedupe marker cleared so Back re-blocks; red badge persists on the
+       blocked page. Rejected alternative (document_start script
+       neutralization) due to breaking legitimate sites.
+   17. [supervisor finding] Brand hidden in URL userinfo
+       (http://paypal.com@evil.tk/ connects to evil.tk while readers see
+       paypal.com) bypassed the hostname-only brand rule - added a +75
+       structure signal, suppressed for official brand domains. Qwen's own
+       round-3 suggestions (DNS TTL, response-time spikes, cert age) were
+       all rejected as infeasible for a no-network extension.
+
+================================================================================
+ 15. KNOWN LIMITATIONS & FUTURE WORK
+================================================================================
+
+   LIMITATIONS
+   - Heuristic scoring only: no ML model or threat-intel feed; novel
+     phishing on clean, short, https, unbranded domains can score 0.
+   - English-only keyword/phrase lists.
+   - A blocked page is fully replaced (no "proceed anyway" override);
+     "Trust Site" in the popup is the recovery path for false positives.
+   - Country-domain brands (e.g. paypal.com.br) are treated as official via
+     a 2-letter ccTLD rule; unusual ccTLDs could still false-positive.
+   - localhost/hosts with "login|secure|bank" + plain http score +40 (dev
+     servers are usually unaffected because "login" must be in the HOST).
+   - Content flags rely on the popup being able to inject into the tab
+     (not possible on chrome:// pages - silently skipped).
+   - Not packed for the Chrome Web Store (load unpacked / zip only).
+
+   FUTURE WORK
+   - Optional "proceed anyway (not recommended)" escape hatch on block page.
+   - Per-reason dismiss ("ignore this signal for this domain").
+   - Machine-learning scorer + threat-intel feed (currently 100% local).
+   - Visual Range/Entropy analysis of domains (homoglyph distance scoring).
+   - Localized keyword packs; enterprise managed-policy whitelist.
+   - Store listing, screenshots, privacy policy.
+
+================================================================================
+ END OF WORKFLOW NOTES
+ Regenerate UI screenshots:  node scripts/capture-ui-screenshots.js
+ Run all tests:              npm test
+ Rebuild package:            bash build.sh
+================================================================================
+

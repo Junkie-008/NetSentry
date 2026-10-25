@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Test PayPal Detection</title>
+    <meta charset="utf-8">
+</head>
+<body>
+    <h1>PayPal Phishing Detection Test</h1>
+    
+    <p>This page is designed to test the PayPal phishing detection capability.</p>
+    
+    <h2>Test Domains:</h2>
+    <ul>
+        <li><strong>paypa1-login.com</strong> - Should be detected (1 instead of l)</li>
+        <li><strong>paypal-security.com</strong> - Should be detected (not official domain)</li>
+        <li><strong>secure-paypal.net</strong> - Should be detected (suspicious)</li>
+        <li><strong>paypal.com</strong> - Should be safe (official)</li>
+    </ul>
+    
+    <h2>What the extension should detect:</h2>
+    <ul>
+        <li>✅ Character substitution (paypa1 instead of paypal)</li>
+        <li>✅ HTTP protocol for financial sites</li>
+        <li>✅ Login/security related keywords</li>
+        <li>✅ Non-official PayPal domains</li>
+    </ul>
+    
+    <p><strong>Expected behavior for paypa1-login.com:</strong></p>
+    <ol>
+        <li>Extension detects "paypa1" variant (80 points)</li>
+        <li>Extension detects HTTP protocol with "login" keyword (40 points)</li>
+        <li>Extension detects mixed letters/numbers (10 points)</li>
+        <li>Total risk score: 130+ (capped at 100)</li>
+        <li>Should trigger blocking (threshold > 70)</li>
+    </ol>
+    
+    <div style="background: #f0f0f0; padding: 20px; margin: 20px 0; border-radius: 5px;">
+        <h3>Troubleshooting:</h3>
+        <p>If the extension doesn't detect this site:</p>
+        <ol>
+            <li>Open Chrome DevTools (F12)</li>
+            <li>Check Console tab for "NetSentry:" messages</li>
+            <li>Verify extension is loaded and active</li>
+            <li>Check if site is in whitelist</li>
+            <li>Reload the extension if needed</li>
+        </ol>
+    </div>
+    
+    <p><em>Created by ABHISHEK for testing phishing detection accuracy.</em></p>
+</body>
+</html>
